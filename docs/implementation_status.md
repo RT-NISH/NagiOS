@@ -2,7 +2,7 @@
 
 **Current milestone:** `M19 — Semantic Layer / Search`
 **Milestone status:** M19 `PARTIAL`, M20 `PARTIAL`, M21–M22 `PARTIAL`,
-M23–M30 `PARTIAL`.
+M23–M29 `PARTIAL`; formal M30 `BLOCKED`.
 **M19 signed Files Search production route, 2026-10-08:** ADR 0069 adds a
 signed first-party `org.nagi.files` client to the ordinary Files Search path.
 The client is built as a separate product package, receives only Object IDs,
@@ -19,6 +19,16 @@ host, `cargo test -p nagi-cli -p nagi-search-ipc`, host clippy for
 release build, and a Nagi-target `cargo check` of `nagi-init` with
 `desktop-password-change-acceptance,m19-files-search-production` passed. The
 `./nagi login` guest acceptance was not run there; CI is the next evidence.
+**Ordinary-session integration foundation:** the shared bridge implements one
+bounded guest-worker request slot, live Session binding, cancellation, late-reply
+rejection and safe retired-worker lifetime rules. Model-service/backend leaves
+and ordinary-session image/release gates are included. Host tests and target
+leaf checks validate contracts and compilation only. Desktop AI consumption,
+durable terms persistence, a real guest worker/Granite reply and complete
+same-image acceptance remain unverified. Formal M30 is `BLOCKED`; the existing
+disk-layout fixture remains separately available as `m30-layout`. Embedding and
+TTS are standalone `PARTIAL` foundations. No milestone is promoted.
+
 **M18 acceptance closure, 2026-10-07:** `origin/main` commit
 `7ff70b83cfdc05c279c1b697ceacf12196e83e1f` passed GitHub Actions run
 [`37601664873`](https://github.com/RT-NISH/NagiOS/actions/runs/37601664873).
@@ -40,6 +50,24 @@ are under `out/evidence/m19-browser-search-1791386170641690000/`. Browser
 history publication is still acceptance-scoped, and a resident production
 Search service plus general Files producer synchronization remain open; M19
 stays `PARTIAL`.
+**M19 ordinary Files recovery checkpoint:** recovered owner-only
+create/rename/trash/restore controls use mirrored trash intent records and bounded
+VFS create/rename undo recovery. Contents and inode/generation are retained;
+Search failure does not disable physical Files operations. The signed Files
+Search client remains in source. Fresh host validation passed 24 Files tests, 93 libnagi unit plus 2 renderer
+tests, 40 Search/IPC/localization regressions, formatting and warnings-denied
+Clippy. A synthetic disk written by the exact-base VFS was read without writes
+or formatting by the recovered VFS; clean new mutations remained readable by
+the old VFS. Imported target/guest logs are historical. Imported guest evidence stopped at M7
+before init. Normal guest UI/Search operations and Browser History acceptance
+remain open; M19 stays `PARTIAL`. See the Files handoff and VFS recovery proposal.
+**Recovery caller follow-up:** read-only inspection diagnoses pending supported
+VFS undo; an explicit Recovery-console `recover` operation performs no-format
+writable recovery and checks full integrity before exposing a mount. Six fresh
+synthetic caller tests pass, including unchanged diagnosis bytes/counters,
+create/rename restoration, rejected input, retry and unrelated corruption after
+journal repair. This is host evidence; normal guest Recovery acceptance remains
+unproven and no Recovery milestone is marked complete.
 **M19 signed-in desktop Files Search runtime, 2026-10-08:** ADR 0068 extracts
 the shared User Data VFS snapshot adapter and starts a bounded SearchService
 when the owner signs in. It enumerates only regular files directly under
@@ -2647,7 +2675,7 @@ confirmed the expected ABI entry point. The next Ubuntu target CI must verify
 the duplicate is gone in the final link. UEFI and real QEMU first-web-pixel
 evidence remain pending. M17 remains `BLOCKED`; M18 remains `NOT STARTED`.
 
-Local verification after the #164 repair passed: focused M17 tests (11), the
+Local verification after the #164 repair passed: focused M18 tests (11), the
 full `nagi-cli` suite (49 unit and 18 CLI tests), focused Clippy,
 `bash -n tools/nagi-target-cc.sh`, and `git diff --check`. The Nagi wrapper
 compiled `nagi-libcpp-abi.cpp` plus the real fontsan OTS `ots.cc` and `cff.cc`
