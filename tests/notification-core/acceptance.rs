@@ -1776,3 +1776,393 @@ fn diagnostics_events_are_rate_limited_to_a_bounded_window() {
             && event.profile_correlation == SafeProfileCorrelation::new([0; 16])
     }));
 }
+
+#[test]
+fn generated_id_collision_preserves_snapshot_and_emits_no_publish_success() {
+    struct RepeatedId;
+    impl NotificationIdGenerator for RepeatedId {
+        fn next_id(&mut self) -> Result<NotificationId, AdapterFailure> {
+            Ok(NotificationId::new(1_u128.to_be_bytes()).unwrap())
+        }
+    }
+    let quota = StoreQuota::default();
+    let store = TestStore::new(quota);
+    let control = store.control.clone();
+    let diagnostics = DiagnosticsControl {
+        events: Rc::new(RefCell::new(Vec::new())),
+        fail: Rc::new(Cell::new(false)),
+    };
+    let mut service = NotificationService::new(
+        MockAdapters(Shared::new()),
+        store,
+        FakeClock::new(100),
+        RepeatedId,
+        TestDiagnostics(diagnostics.clone()),
+        quota,
+        PolicyFailureMode::Reject,
+    )
+    .unwrap();
+    let original = request(
+        "app.notes",
+        public_text("original"),
+        public_text("body"),
+        Priority::Normal,
+        None,
+        None,
+        Vec::new(),
+    );
+    service.publish(&caller("A"), original).unwrap();
+    let before = control.snapshot("A").unwrap();
+    let events = diagnostics.events.borrow().clone();
+    let replacement = request(
+        "app.notes",
+        public_text("replacement"),
+        public_text("other"),
+        Priority::High,
+        None,
+        None,
+        Vec::new(),
+    );
+    assert_eq!(
+        service.publish(&caller("A"), replacement),
+        Err(NotificationError::DuplicateNotificationId)
+    );
+    assert_eq!(control.snapshot("A").unwrap(), before);
+    assert_eq!(*diagnostics.events.borrow(), events);
+}
+
+#[test]
+fn failed_expiry_cleanup_retries_atomically_and_emits_success_once() {
+    let (mut service, _, clock, store, diagnostics) = make_service(StoreQuota::default());
+    let id = publish(
+        &mut service,
+        "A",
+        request(
+            "app.notes",
+            public_text("title"),
+            public_text("body"),
+            Priority::Normal,
+            Some(Timestamp(110)),
+            None,
+            Vec::new(),
+        ),
+    );
+    let before = store.snapshot("A").unwrap();
+    diagnostics.events.borrow_mut().clear();
+    clock.set(110);
+    store.fail_next_commit.set(true);
+    assert_eq!(
+        service.cleanup_expired(&caller("A")),
+        Err(NotificationError::PersistenceUnavailable)
+    );
+    assert_eq!(store.snapshot("A").unwrap(), before);
+    assert!(!diagnostics
+        .events
+        .borrow()
+        .iter()
+        .any(|event| event.code == NotificationEventCode::Expired));
+    assert_eq!(service.cleanup_expired(&caller("A")).unwrap().expired, [id]);
+    let committed = store.snapshot("A").unwrap();
+    assert_eq!(committed.generation(), before.generation() + 1);
+    assert!(committed.records().is_empty());
+    assert!(service
+        .cleanup_expired(&caller("A"))
+        .unwrap()
+        .expired
+        .is_empty());
+    assert_eq!(store.snapshot("A").unwrap(), committed);
+    let events = diagnostics.events.borrow();
+    let expired: Vec<_> = events
+        .iter()
+        .filter(|event| event.code == NotificationEventCode::Expired)
+        .collect();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].count, 1);
+}
+
+#[test]
+fn dismissed_record_retries_do_not_commit_emit_or_reactivate_actions() {
+    let (mut service, shared, _, store, diagnostics) = make_service(StoreQuota::default());
+    let action_id = ActionId::new("notes.open").unwrap();
+    let id = publish(
+        &mut service,
+        "A",
+        request(
+            "app.notes",
+            public_text("title"),
+            public_text("body"),
+            Priority::Normal,
+            None,
+            None,
+            vec![action("notes.open")],
+        ),
+    );
+    service.dismiss(&caller("A"), id).unwrap();
+    let before = store.snapshot("A").unwrap();
+    let events = diagnostics.events.borrow().clone();
+    store.fail_next_commit.set(true);
+    assert_eq!(
+        service.dismiss(&caller("A"), id),
+        Ok(MutationOutcome::Unchanged)
+    );
+    assert_eq!(
+        service.acknowledge(&caller("A"), id),
+        Ok(MutationOutcome::Unchanged)
+    );
+    assert_eq!(
+        service.mark_read(&caller("A"), id),
+        Ok(MutationOutcome::Unchanged)
+    );
+    assert!(store.fail_next_commit.get());
+    assert_eq!(
+        service.activate_action(&caller("A"), id, &action_id),
+        Err(NotificationError::Expired)
+    );
+    assert_eq!(shared.0.borrow().action_provider_calls, 0);
+    assert_eq!(store.snapshot("A").unwrap(), before);
+    assert_eq!(*diagnostics.events.borrow(), events);
+    assert!(query_active(&mut service, "A").is_empty());
+}
+
+#[test]
+fn defer_at_expiry_never_becomes_visible_or_resolves_an_action() {
+    let (mut service, shared, clock, store, _) = make_service(StoreQuota::default());
+    shared.0.borrow_mut().policy = Ok(PolicyDecision::DeferUntil(Timestamp(110)));
+    let id = publish(
+        &mut service,
+        "A",
+        request(
+            "app.notes",
+            public_text("title"),
+            public_text("body"),
+            Priority::Normal,
+            Some(Timestamp(110)),
+            None,
+            vec![action("notes.open")],
+        ),
+    );
+    for now in [109, 110, 111] {
+        clock.set(now);
+        assert!(query_active(&mut service, "A").is_empty());
+        assert_eq!(
+            service.ui_view(&caller("A"), id, &locale()),
+            Err(NotificationError::Expired)
+        );
+        assert_eq!(
+            service.activate_action(&caller("A"), id, &ActionId::new("notes.open").unwrap()),
+            Err(NotificationError::Expired)
+        );
+    }
+    assert_eq!(shared.0.borrow().action_provider_calls, 0);
+    assert_eq!(store.snapshot("A").unwrap().records().len(), 1);
+    assert_eq!(service.cleanup_expired(&caller("A")).unwrap().expired, [id]);
+}
+
+#[test]
+fn repeated_payload_publish_has_fresh_ids_without_inferred_content_dedup() {
+    let (mut service, _, _, store, diagnostics) = make_service(StoreQuota::default());
+    let payload = request(
+        "app.notes",
+        public_text("same"),
+        public_text("body"),
+        Priority::Normal,
+        None,
+        None,
+        Vec::new(),
+    );
+    let first = service.publish(&caller("A"), payload.clone()).unwrap().id;
+    let second = service.publish(&caller("A"), payload).unwrap().id;
+    assert_ne!(first, second);
+    let snapshot = store.snapshot("A").unwrap();
+    assert_eq!(snapshot.records().len(), 2);
+    assert_eq!(snapshot.generation(), 2);
+    assert_eq!(
+        diagnostics
+            .events
+            .borrow()
+            .iter()
+            .filter(|event| event.code == NotificationEventCode::Published)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn restored_snapshots_enforce_group_quota() {
+    assert_snapshot_group_quota(NOTIFICATION_STORE_SCHEMA_VERSION);
+}
+
+#[test]
+fn migrated_snapshots_enforce_group_quota() {
+    assert_snapshot_group_quota(0);
+}
+
+fn assert_snapshot_group_quota(version: u16) {
+    for groups in [1, 2] {
+        let (mut seed, _, _, seed_store, _) = make_service(StoreQuota::default());
+        for index in 0..groups {
+            publish(
+                &mut seed,
+                "A",
+                request(
+                    "app.notes",
+                    public_text("title"),
+                    public_text("body"),
+                    Priority::Normal,
+                    None,
+                    Some(GroupingKey::new(format!("group-{index}")).unwrap()),
+                    Vec::new(),
+                ),
+            );
+        }
+        let original = seed_store.snapshot("A").unwrap();
+        let snapshot = NotificationSnapshot::from_parts(
+            version,
+            original.generation(),
+            original.records().to_vec(),
+        );
+        let quota = StoreQuota {
+            max_groups_per_profile: 1,
+            ..StoreQuota::default()
+        };
+        let mut store = TestStore::new(quota);
+        store.inner.inject_snapshot("A".into(), snapshot.clone());
+        let (mut service, _, _, control, diagnostics) =
+            service_with(quota, PolicyFailureMode::Reject, store);
+        let result = service.query(&caller("A"), NotificationQuery::default());
+        if groups == 1 {
+            assert_eq!(result.unwrap().len(), 1);
+            assert_eq!(
+                control.snapshot("A").unwrap().schema_version(),
+                NOTIFICATION_STORE_SCHEMA_VERSION
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(NotificationError::CorruptState),
+                "schema {version}"
+            );
+            assert_eq!(
+                service.query(&caller("A"), NotificationQuery::default()),
+                Err(NotificationError::RecoveryReadOnly)
+            );
+            assert_eq!(control.snapshot("A").unwrap(), snapshot);
+            let events = diagnostics.events.borrow();
+            assert!(events
+                .iter()
+                .any(|event| event.code == NotificationEventCode::StoreRecovered));
+            assert!(!events
+                .iter()
+                .any(|event| event.code == NotificationEventCode::MigrationApplied));
+        }
+    }
+}
+
+struct SnapshotAllocationProbe;
+thread_local! {
+ static SNAPSHOT_TRACK:Cell<bool>=const {Cell::new(false)};
+ static SNAPSHOT_MAX_ALLOC:Cell<usize>=const {Cell::new(0)};
+ static SNAPSHOT_ALLOC_COUNT:Cell<usize>=const {Cell::new(0)};
+}
+// Track only the calling test thread; fixture construction and persistence
+// cloning are excluded from the measured validation interval.
+unsafe impl std::alloc::GlobalAlloc for SnapshotAllocationProbe {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if SNAPSHOT_TRACK.try_with(|x| x.get()).unwrap_or(false) {
+            let _ = SNAPSHOT_MAX_ALLOC.try_with(|x| x.set(x.get().max(l.size())));
+            let _ = SNAPSHOT_ALLOC_COUNT.try_with(|x| x.set(x.get() + 1));
+        }
+        unsafe { std::alloc::System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        if SNAPSHOT_TRACK.try_with(|x| x.get()).unwrap_or(false) {
+            let _ = SNAPSHOT_MAX_ALLOC.try_with(|x| x.set(x.get().max(n)));
+            let _ = SNAPSHOT_ALLOC_COUNT.try_with(|x| x.set(x.get() + 1));
+        }
+        unsafe { std::alloc::System.realloc(p, l, n) }
+    }
+}
+#[global_allocator]
+static SNAPSHOT_ALLOCATOR: SnapshotAllocationProbe = SnapshotAllocationProbe;
+struct MoveOnlySnapshotStore(Option<NotificationSnapshot<String>>);
+impl NotificationPersistence<String, String> for MoveOnlySnapshotStore {
+    fn load(&mut self, _: &String) -> Result<StoreLoad<String>, PersistenceError> {
+        Ok(self
+            .0
+            .take()
+            .map(StoreLoad::Snapshot)
+            .unwrap_or(StoreLoad::Empty))
+    }
+    fn commit_atomic(
+        &mut self,
+        _: &String,
+        _: u64,
+        _: NotificationSnapshot<String>,
+    ) -> Result<(), PersistenceError> {
+        panic!("oversize snapshot must never commit")
+    }
+    fn usage(&self) -> StoreUsage {
+        StoreUsage::default()
+    }
+}
+#[test]
+fn oversize_snapshot_rejects_before_group_workspace_allocation() {
+    let (mut seed, _, _, control, _) = make_service(StoreQuota::default());
+    for i in 0..128 {
+        publish(
+            &mut seed,
+            "A",
+            request(
+                "app.notes",
+                public_text("a"),
+                public_text("b"),
+                Priority::Normal,
+                None,
+                Some(GroupingKey::new(format!("g{i}")).unwrap()),
+                Vec::new(),
+            ),
+        );
+    }
+    let snapshot = control.snapshot("A").unwrap();
+    let quota = StoreQuota {
+        max_notifications_per_profile: 1,
+        max_query_results: 1,
+        max_groups_per_profile: 1,
+        ..StoreQuota::default()
+    };
+    let mut service = NotificationService::new(
+        MockAdapters(Shared::new()),
+        MoveOnlySnapshotStore(Some(snapshot)),
+        FakeClock::new(100),
+        SequenceIds(1000),
+        NullNotificationDiagnostics,
+        quota,
+        PolicyFailureMode::Reject,
+    )
+    .unwrap();
+    let caller = caller("A");
+    let query = NotificationQuery {
+        limit: 1,
+        ..NotificationQuery::default()
+    };
+    SNAPSHOT_MAX_ALLOC.with(|x| x.set(0));
+    SNAPSHOT_ALLOC_COUNT.with(|x| x.set(0));
+    SNAPSHOT_TRACK.with(|x| x.set(true));
+    let result = service.query(&caller, query);
+    SNAPSHOT_TRACK.with(|x| x.set(false));
+    let max_alloc = SNAPSHOT_MAX_ALLOC.with(|x| x.get());
+    let count = SNAPSHOT_ALLOC_COUNT.with(|x| x.get());
+    assert_eq!(result, Err(NotificationError::CorruptState));
+    println!(
+        "128 records rejected against item quota 1: {count} allocations; largest {max_alloc} bytes"
+    );
+    // With an item cap of one, validating a rejected snapshot needs only bounded
+    // recovery metadata, never an allocation large enough to collect all 128 keys.
+    assert!(
+        max_alloc <= 256,
+        "allocated {max_alloc} bytes before rejecting item quota 1"
+    );
+}
